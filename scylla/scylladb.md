@@ -14,6 +14,54 @@ ScyllaDB is a high-performance, Apache Cassandra-compatible NoSQL database writt
 
 ## Architecture
 
+### How Shards Work with Replication and Multiple Nodes
+
+Replication and sharding are orthogonal — replication operates between nodes, sharding operates inside each node.
+
+```
+Token ring  → decides which NODES own replicas  (cluster level)
+Replication → copies data across those nodes    (node level)
+Sharding    → within each node, which CORE      (node-internal)
+              handles the data
+```
+
+**Write path (RF=3, 3 nodes, 4 shards each):**
+```
+pk=alice → token 10% → primary: Node 1, replicas: Node 2, Node 3
+
+Client → coordinator (Node 2, any shard that receives the connection)
+  Coordinator sends write to all 3 nodes in parallel:
+    → Node 1: network → routed to Shard that owns token 10%
+    → Node 2: SPSC queue → routed to Shard that owns token 10%
+    → Node 3: network → routed to Shard that owns token 10%
+  Each shard: CommitLog → memtable
+  Coordinator waits for CL (LOCAL_QUORUM = 2 of 3) → acks client
+```
+
+**Shard assignment is per-node, not cluster-wide:**
+Nodes independently divide their token range across their shards. Different nodes can have different core counts — the same token might be Shard 10 on Node 1 (32 cores) but Shard 2 on Node 2 (16 cores). Only the token range matters for routing, not the shard number.
+
+**Read path (LOCAL_QUORUM):**
+Coordinator sends read to all RF replicas, waits for quorum responses, merges by timestamp, returns to client. If replicas disagree, coordinator pushes correct version back to stale shard (read repair).
+
+**Cross-shard vs cross-node:**
+```
+Cross-shard (same node): SPSC lock-free queue → ~100ns
+Cross-node (replication): TCP over NIC         → ~0.1–1ms same AZ
+```
+
+**Streaming is shard-aware:**
+When a new node joins, each shard streams only its own token range data directly to the corresponding shard on the new node — no cross-shard coordination needed.
+
+**With tablets (v6+):** the system table records exactly which node AND which shard owns each tablet. The load balancer can target a specific shard on a specific node, balancing across both dimensions independently.
+
+| Concept | Scope | Determines |
+|---|---|---|
+| Token ring | Cluster | Which nodes store replicas |
+| Replication Factor | Cluster | How many node copies |
+| Vnode / Tablet | Node | How token ranges are assigned |
+| Shard | Node-internal | Which core handles a token range |
+
 ### How Different Tables with Different Partition Keys End Up on the Same Shard
 
 A shard owns a **token range**, not a table or a key. Every partition key from every table is hashed to a token — if two keys from different tables produce tokens that fall in the same shard's range, they both live on that shard.
@@ -289,6 +337,54 @@ echo none > /sys/block/nvme0n1/queue/scheduler
 #### CPU Pinning Gotcha
 
 ScyllaDB pins each shard to a physical core at startup. In containers, it detects available cores and creates exactly that many shards. Always allocate **whole cores** — fractional CPU limits (e.g., 1.5 cores) waste a shard slot.
+
+### How the Token Range is Divided Across a Cluster
+
+ScyllaDB uses the **Murmur3 partitioner**. Every partition key is hashed to a 64-bit signed integer:
+```
+Token space: -2^63  ──────────────────────────────  2^63 - 1
+Total size: 2^64 values (~18.4 quintillion)
+```
+The space is a ring — `2^63 - 1` wraps around to `-2^63`.
+
+**Step 1 — Division across nodes (vnodes):**
+
+Without vnodes (simple): ring divided into N equal contiguous slices. Problem: adding a node requires streaming half of one node's data.
+
+With vnodes (default 256 per node): ring divided into `N × 256` equally spaced slots, distributed in an interleaved (scattered) pattern:
+```
+3 nodes × 256 vnodes = 768 slots
+Step = 2^64 / 768
+
+Slot 0 → Node 1,  Slot 1 → Node 2,  Slot 2 → Node 3
+Slot 3 → Node 1,  Slot 4 → Node 2,  Slot 5 → Node 3  ...
+```
+Node 1 gets 256 scattered token positions. Scattering ensures that when Node 1 fails, its ranges are spread across all other nodes — no single node absorbs all the load.
+
+**Step 2 — Division within a node (shards):**
+
+Within each node, every token maps to a shard via:
+```
+shard_id = floor((token + 2^63) × num_shards / 2^64)
+```
+This divides the full token space into `num_shards` equal slices. A node doesn't own all tokens in a shard's slice — only the ones its vnodes cover — but the formula applies uniformly across the full space.
+
+**Combined formula:**
+```
+pk → token:   murmur3(serialized_partition_key)   range: [-2^63, 2^63)
+token → node: vnode lookup (or tablet map)
+token → shard: floor((token + 2^63) × num_shards / 2^64)
+```
+
+**Adding a node — vnodes vs tablets:**
+```
+Vnodes: new node gets 256 evenly interleaved positions
+  → each existing node gives up ~1/N of its vnodes
+  → all existing nodes stream simultaneously → cluster-wide I/O storm
+
+Tablets: load balancer moves one tablet at a time
+  → one source node streams one tablet → sequential, no I/O storm
+```
 
 ### Token Ring & Consistent Hashing
 - Data is distributed across nodes using a token ring (same as Cassandra)
@@ -809,6 +905,88 @@ cluster = Cluster(
 | Conflict resolution | Ensure NTP sync; avoid concurrent writes to same key if ordering matters |
 | Repair cadence | Weekly minimum; always after node recovery |
 
+### Seed Nodes and Gossip Protocol
+
+#### Seed Nodes
+
+A seed node is a **well-known entry point** — a stable node whose address is hardcoded in `scylla.yaml` so new nodes have somewhere to call on first boot.
+
+```yaml
+seeds: "10.0.1.1,10.0.1.2,10.0.1.3"
+```
+
+Seeds have no elevated role in a running cluster — they are just bootstrap contacts. Existing nodes run fine even if all seeds are down. After a node joins, it gossips with random peers and never needs seeds again.
+
+Best practice: 2–3 seeds, one per AZ, on stable long-running nodes (not spot/ephemeral). Every node should have the same seed list.
+
+#### Gossip Protocol
+
+Gossip is ScyllaDB's **peer-to-peer epidemic protocol** — every node continuously exchanges state with a few random peers; information spreads like a rumor.
+
+**One gossip round (every 1 second):**
+```
+Node A picks 1–3 random peers
+
+SYN:  A → B: digest of all nodes A knows { node_id, generation, max_version }
+ACK:  B compares digest → sends newer state A is missing; requests state B needs
+ACK2: A sends state B requested
+
+Both nodes now have each other's latest knowledge.
+```
+
+**What gossip carries:**
+
+| State | Content |
+|---|---|
+| `STATUS` | `NORMAL`, `JOINING`, `LEAVING`, `DECOMMISSIONED` |
+| `TOKENS` | Token ranges this node owns |
+| `SCHEMA` | Hash of schema — mismatch triggers schema sync |
+| `DC` / `RACK` | Topology for NetworkTopologyStrategy |
+| `LOAD` | Approximate data size |
+| `RELEASE_VERSION` | ScyllaDB version |
+
+**Heartbeat (generation + version):**
+```
+generation = Unix timestamp when node last started (jumps on restart)
+version    = increments every second (the heartbeat tick)
+```
+Other nodes see a generation jump and know the node restarted vs just being slow.
+
+**Phi Accrual Failure Detector:**
+Tracks inter-arrival times of heartbeats, computes phi (probability score for "is this node dead?"):
+```
+phi < 8  → node UP
+phi = 8  → threshold → node marked DOWN  (typically 10–30s after last heartbeat)
+phi > 8  → node definitely dead
+```
+Adapts to network jitter — high-latency AZs get more tolerance before being declared dead.
+
+**Convergence speed:**
+```
+Rounds to full convergence ≈ log₃(N)
+  N=100 nodes:  ~5 seconds
+  N=1000 nodes: ~7 seconds
+```
+O(log N) — gossip scales gracefully with cluster size.
+
+**Bootstrap flow:**
+```
+New node → contacts seed → receives full cluster state
+         → announces JOINING via gossip
+         → existing nodes stream token range data
+         → announces NORMAL via gossip
+         → gossips with random peers (seeds no longer needed)
+```
+
+**Gossip vs centralised coordination:**
+
+| | Gossip | ZooKeeper / etcd |
+|---|---|---|
+| SPOF | None | Coordinator quorum |
+| Scalability | O(log N) | Limited by coordinator |
+| Consistency | Eventual (seconds) | Strong |
+| Failure detection | Built-in (phi accrual) | Requires separate heartbeat |
+
 ### What Happens When a Node Dies
 
 #### Detection (~0–30 seconds)
@@ -1174,6 +1352,338 @@ Populate row cache → return to client
 - **Row cache** eliminates repeated disk reads for hot data
 - **Bloom filter** eliminates unnecessary SSTable opens for cold/absent data
 - They operate at different layers and complement each other
+
+---
+
+## Secondary Indexes
+
+Without a secondary index, any query on a non-partition-key column requires a full cluster scan (`ALLOW FILTERING`) — catastrophically slow. Secondary indexes solve this without schema redesign.
+
+### Three Options
+
+| | Local Index | Global Index | Materialized View |
+|---|---|---|---|
+| Created by | `CREATE INDEX` (local) | `CREATE INDEX` (default) | `CREATE MATERIALIZED VIEW` |
+| Storage location | Same node as base data | Any node (hash of indexed col) | Any node (hash of view PK) |
+| Partition key required in query | Yes | No | No |
+| Extra node hop on read | 0 | 1 | 0 (view is a real table) |
+| Extra node hop on write | 0 | 1 | 1 |
+| Consistency with base | Atomic (same shard) | Eventually consistent | Eventually consistent |
+
+### Global Secondary Index
+
+ScyllaDB creates a hidden MV internally. Indexed column becomes the view's partition key:
+
+```cql
+CREATE INDEX ON users(email);
+-- Hidden MV: partition key = email, clustering key = user_id
+-- Stored across ALL nodes based on murmur3(email)
+```
+
+**Write:** base table write + index node write (2 nodes, not atomic)
+**Read:**
+```
+WHERE email = 'alice@example.com'
+  1. Coordinator → index node (hash of email) → returns user_id
+  2. Coordinator → base node (hash of user_id) → returns full row
+  → 2 internal round trips (~2× latency)
+```
+
+### Local Secondary Index (ScyllaDB-specific)
+
+Index co-located with base data — same node, same shard:
+
+```cql
+CREATE INDEX ON users((user_id), email);
+-- (( )) means: index partition key = base table partition key
+```
+
+**Write:** base write + local index write on SAME shard → zero extra network hop
+**Read:**
+```
+WHERE user_id = 'alice' AND email = 'alice@example.com'
+  1. Coordinator → owning node → local index lookup → returns row
+  → 1 round trip (same as base table read)
+```
+
+**Constraint:** partition key MUST be in the WHERE clause. Cannot answer "find all users with email X" cluster-wide — only "within partition X, find rows where email = Y".
+
+### Materialized View (user-defined)
+
+Full denormalized copy with user-controlled schema:
+
+```cql
+CREATE MATERIALIZED VIEW users_by_email AS
+  SELECT user_id, email, name
+  FROM users
+  WHERE email IS NOT NULL AND user_id IS NOT NULL
+  PRIMARY KEY (email, user_id);
+
+-- Query like a regular table (1 hop — no base table lookup needed)
+SELECT * FROM users_by_email WHERE email = 'alice@example.com';
+```
+
+MV vs global index: global index is a fixed-schema MV (indexed col + base PK only). MV is flexible — control which columns are stored, add clustering columns, filter rows in the definition.
+
+### Write Consistency Challenge
+
+Global index and MV writes are **not atomic** with the base table:
+```
+Write base table: success ✓
+Write index/MV node: node down ✗
+→ base and index diverge → stale index (query misses recently written row)
+```
+ScyllaDB retries failed MV writes via a view update backlog, but there is a window of inconsistency. Local indexes don't have this — the index write is on the same shard, handled together with the base write.
+
+### Read/Write Path Summary
+
+```
+Global index read:  client → coordinator → index node → base node → client  (2 hops)
+Local index read:   client → coordinator → owning node → client              (1 hop)
+MV read:            client → coordinator → view node → client                (1 hop)
+
+Global index write: base node + index node  (2 nodes)
+Local index write:  base node only          (0 extra hops)
+MV write:           base node + view node   (2 nodes)
+```
+
+### Performance Impacts and Best Practices for Secondary Indexes
+
+#### Write Performance Impact
+
+**Local SI** — negligible: +1 local memtable write per replica (same shard, zero network).
+
+**Global Index / MV** — significant:
+```
+Per replica (RF=3): +1 local read + cross-node MV write
+Table with 3 MVs:   3 base + 3 reads + up to 27 MV writes per client write
+```
+Never MV-index a frequently updated column:
+```cql
+-- catastrophic: every page load updates last_seen → read + delete + insert in MV
+CREATE MATERIALIZED VIEW users_by_last_seen ...  PRIMARY KEY (last_seen, user_id)
+```
+
+#### Read Performance Impact
+
+Selectivity determines everything for global index:
+```
+High cardinality (email, UUID): 2 hops → fast
+Low cardinality (status='active', 80% of rows): phase 2 fans out to all nodes → O(total data)
+Rule: global index column should have thousands+ of distinct values
+```
+
+Tombstone accumulation on indexed column updates: each email change leaves a tombstone in the old MV partition → degrades reads over time.
+
+#### Storage Impact
+```
+Global index:   ~50 bytes/row (indexed col + base PK)      small, distributed
+Local SI:       ~50 bytes/row                               tiny, co-located
+MV SELECT *:    full row copy                               doubles storage
+MV projected:   only selected columns                       much smaller
+```
+Always project only needed columns in MVs — never `SELECT *` unless required.
+
+#### Compaction Impact
+
+Each index/MV is an independent SSTable set with its own compaction. Table with 3 MVs + 2 local SIs = 6 concurrent compaction workloads on the same NVMe. Rule of thumb: **max 2–3 MVs per write-heavy table**.
+
+#### MV Lag
+
+MV writes are async — under high write load the view falls behind. Monitor:
+```bash
+scylla_view_update_backlog_size   # should stay near 0
+```
+
+#### Best Practices
+
+1. **Prefer Local SI when partition key is known** — almost free, atomic, 1 hop
+2. **Test selectivity before adding global index** — `SELECT COUNT(DISTINCT col) FROM table`; < ~1000 distinct values → avoid
+3. **Project only needed columns in MVs** — `SELECT user_id, email, role` not `SELECT *`
+4. **Filter rows in MV definition** — `WHERE is_active = true` excludes rows never queried → saves storage and write overhead
+5. **Never index frequently changing columns in MVs** — email/phone (set once) good; last_seen/status/score (changes often) bad
+6. **Limit MVs per table** — 1–2 MVs: fine; 3 MVs: monitor carefully; 4+: reconsider schema
+7. **Prefer schema design over indexing** — a dedicated lookup table (write to both on insert) is faster and consistent vs a MV with eventual consistency gap
+8. **Repair includes MVs** — `nodetool repair` on base table also repairs its MVs
+
+#### Performance Cost Matrix
+
+| | Local SI | Global Index | MV (projected) |
+|---|---|---|---|
+| Write overhead | ~0 | 1 read + cross-node write | 1 read + cross-node write |
+| Read overhead | 0 extra hops | +1 hop (high selectivity) | 0 extra hops |
+| Storage | Tiny, co-located | Small, distributed | Partial copy |
+| Consistency | Atomic | Eventually | Eventually |
+| Tombstone risk | Low | Medium | High (on updates) |
+| Max per table | ~5 fine | 2–3 max | 2–3 max |
+
+### When to Use Local SI vs Materialized View
+
+**Decision framework — work through in order:**
+
+1. **Do you always know the partition key at query time?**
+   - YES → Local SI is viable (and preferred if it fits)
+   - NO → must use MV or Global Index
+
+2. **Does the query cross partition boundaries?**
+   - Filter within one partition ("orders for customer X with status=pending") → Local SI
+   - Unknown partition ("find user by email") → MV
+
+3. **How write-heavy is the workload?**
+   - Very write-heavy / latency-sensitive → Local SI (zero cross-node write overhead)
+   - Moderate writes → MV acceptable
+
+4. **Can you tolerate brief stale reads?**
+   - NO → Local SI only (atomic with base)
+   - YES → MV or Global Index
+
+5. **Do you need custom view structure?**
+   - Different clustering order, column projection, row filtering → MV
+   - Just find rows by a column → Global Index (simpler)
+
+**Use Local SI when:** always querying with partition key + filtering within it.
+```cql
+-- Orders for customer X filtered by status (customer_id always known)
+CREATE INDEX ON orders((customer_id), status);
+SELECT * FROM orders WHERE customer_id = X AND status = 'pending';
+```
+Zero write overhead, 1 hop, atomically consistent, low storage.
+
+**Use MV when:** need to query by a column that is not the base partition key, or need a fully different access shape.
+```cql
+-- Login: look up user by email (don't know user_id at login time)
+CREATE MATERIALIZED VIEW users_by_email AS
+  SELECT user_id, email, hashed_password
+  FROM users
+  WHERE email IS NOT NULL AND user_id IS NOT NULL
+  PRIMARY KEY (email, user_id);
+-- 1 hop — MV is a real table, no extra base lookup needed
+
+-- Order tracking: customer has tracking number, not order_id
+CREATE MATERIALIZED VIEW orders_by_tracking AS
+  SELECT tracking_no, customer_id, order_id, status
+  FROM orders
+  WHERE tracking_no IS NOT NULL AND customer_id IS NOT NULL AND order_id IS NOT NULL
+  PRIMARY KEY (tracking_no, customer_id, order_id);
+```
+Use MV over Global Index when: need full row in 1 hop, custom clustering order, column projection, or row filtering in view definition.
+
+**Anti-patterns:**
+```
+❌ MV on low-cardinality column (status, country) → fan-out on reads
+❌ MV on frequently updated rows → read-before-write on every update
+❌ MV with SELECT * on wide rows → doubles storage
+❌ Local SI when partition key not always known at query time
+❌ Local SI to search across all partitions (only works within one partition)
+```
+
+**Decision tree:**
+```
+Always know partition key? → YES → Local SI (filter within partition)
+                          → NO  → Need full row in 1 hop?   → MV
+                                   Custom clustering/filter? → MV
+                                   Simple high-cardinality?  → Global Index
+                                   Low cardinality column?   → Redesign schema
+```
+
+### Read Path: Scatter-Gather vs Direct Lookup
+
+**ALLOW FILTERING (no index) — scatter-gather:**
+Coordinator fans out to ALL nodes, each scans all SSTables. Cost = O(total cluster data). Never use in production on large tables.
+
+**Global index (high selectivity) — 2-phase direct lookup:**
+```
+Phase 1: hash(indexed_value) → index node → returns base PK(s)
+Phase 2: hash(base_pk) → base node → returns full row
+Total: 2 internal round trips (~2× regular read latency)
+```
+
+**Global index (low selectivity) — 2-phase fan-out:**
+Phase 1 returns millions of base PKs → Phase 2 fans out to all nodes for each → approaches scatter-gather performance. Worse than ALLOW FILTERING in some cases (random lookups vs sequential scan).
+
+```
+High selectivity (email, UUID): 1 base PK → 1 extra hop → fast
+Low selectivity (country, status): millions of PKs → fan-out to all nodes → slow
+Rule: avoid global index on columns with < ~1000 distinct values
+```
+
+**Global index on range query:**
+Each distinct indexed value is a separate index partition on potentially different nodes. A 31-day date range = up to 31 separate index lookups → near scatter-gather. Use clustering columns for range queries, not global indexes.
+
+**Local index — direct lookup, 1 hop:**
+```
+hash(partition_key) → owning node
+  local index lookup + base table lookup (same shard, zero network)
+Total: 1 round trip — same as regular base table read
+```
+
+**Consistency level cost:**
+Global index at LOCAL_QUORUM pays LOCAL_QUORUM twice (once per phase). Local index pays it once.
+
+**Summary:**
+
+| Query type | Pattern | Hops | Cost |
+|---|---|---|---|
+| ALLOW FILTERING | Scatter-gather | N | O(total data) |
+| Global index, high selectivity | 2-phase direct | 2 | O(1) |
+| Global index, low selectivity | 2-phase + fan-out | 2+N | ~O(total data) |
+| Global index, range query | Multi-index + fan-out | M+N | expensive |
+| Local index | Direct lookup | 1 | O(1) |
+
+### Write Path: Local SI vs MV
+
+**Local SI write (atomic, zero extra hops):**
+```
+Base Replica Node (Shard 2):
+  1. CommitLog append — covers base + index in one atomic append
+  2. Base memtable write
+  3. Local index memtable write (same shard)
+  4. Ack coordinator
+```
+
+**MV / Global Index write (async, cross-node):**
+```
+Base Replica Node:
+  1. Read existing row (local) → get old indexed column value
+  2. Compute MV delta:
+       DELETE old MV entry (old indexed value → base PK)
+       INSERT new MV entry (new indexed value → base PK)
+  3. CommitLog + memtable for base write
+  4. Send MV mutations to MV replica nodes (ASYNC — different nodes)
+  5. Ack coordinator (WITHOUT waiting for MV write to complete)
+
+MV Replica Node (async):
+  CommitLog + memtable for MV entry
+```
+
+**Read-before-write:** every MV write that changes an indexed column requires reading the old value to delete the old MV entry. Local SI never needs this.
+
+**Consistency gap:** client ack is based on base CL only — MV write is async → window where index is stale. ScyllaDB retries via a per-shard **view update backlog**. Local SI has no gap — CommitLog covers both atomically.
+
+**Write amplification (RF=3, one MV):**
+```
+Local SI:  3 base writes + 3 local index writes = 3 nodes, 0 extra hops
+MV/Global: 3 base writes + 3 local reads + up to 3×RF cross-node MV writes
+```
+
+| | Local SI | MV / Global Index |
+|---|---|---|
+| Read-before-write | No | Yes (updates/deletes) |
+| Index write location | Same shard | Cross-node (async) |
+| CommitLog | Single atomic append | Separate appends |
+| Consistency | Atomic with base | Eventually consistent |
+| Client ack waits for | Base + index | Base only |
+| Failure handling | N/A | View update backlog |
+
+### When to Use Each
+
+| Scenario | Use |
+|---|---|
+| Query by non-PK column, don't know partition key | Global index or MV |
+| Query by non-PK column, always know partition key | Local index |
+| Need full row without 2-hop read overhead | MV |
+| Write-heavy, can't afford cross-node index write | Local index |
+| Need filtered view (only some rows in view) | MV (supports WHERE in definition) |
 
 ---
 
@@ -2223,3 +2733,11 @@ Hot partitions cannot be fixed by scaling — only schema redesign fixes them. W
 27. How does ScyllaDB's I/O scheduler prioritize reads over compaction?
 28. What is a shard in ScyllaDB?
 29. How do different tables with different partition keys end up on the same shard?
+30. How do shards work with replication and multiple nodes?
+31. How is the token range (-2^63 to 2^63) divided across a cluster?
+32. What are seed nodes and how does the gossip protocol work?
+33. What are secondary indexes and how do local vs global (MV) indexes differ?
+34. What is the write path for secondary indexes (Local SI vs Materialized View)?
+35. What is the read path for secondary index queries (scatter-gather vs direct lookup)?
+36. When should you use local secondary index vs materialized view?
+37. What are the performance impacts and best practices for secondary indexes?
