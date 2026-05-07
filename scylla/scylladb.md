@@ -14,6 +14,69 @@ ScyllaDB is a high-performance, Apache Cassandra-compatible NoSQL database writt
 
 ## Architecture
 
+### How Different Tables with Different Partition Keys End Up on the Same Shard
+
+A shard owns a **token range**, not a table or a key. Every partition key from every table is hashed to a token — if two keys from different tables produce tokens that fall in the same shard's range, they both live on that shard.
+
+```
+Table: users,  pk = "alice"    → murmur3("alice")    → token 1,234,567 → Shard 2
+Table: orders, pk = "order-99" → murmur3("order-99") → token 1,300,000 → Shard 2
+Table: events, pk = "2024-01"  → murmur3("2024-01")  → token 1,280,000 → Shard 2
+```
+
+The token ring is cluster-level, not per-table. A shard's range applies to all tables simultaneously. Within the shard, each table is kept separate (own memtable, own SSTables):
+
+```
+Shard 2:
+  ├── memtable  → users table
+  ├── memtable  → orders table
+  ├── SSTables/ → users/
+  └── SSTables/ → orders/
+```
+
+**With vnodes:** 256 vnodes per node divided evenly among shards. For every range a shard owns, ALL tables' partitions hashing into that range live there. Hot shard problem: if two tables both have hot partitions hashing to the same shard, they compound — both burden the same shard with no relief.
+
+**With tablets (v6+):** each table has its own independent tablet map. Same token range can map to different shards for different tables. The load balancer can move each table's tablets independently — a hot `users` tablet doesn't affect `orders` placement.
+
+| | Vnodes | Tablets |
+|---|---|---|
+| Token-to-shard mapping | Global (all tables share same ring) | Per-table |
+| Two tables, same token range | Always same shard | Can be different shards |
+| Hot shard from multiple tables | Compounds | Independent per table |
+
+### What is a Shard?
+
+A shard is **one CPU core's exclusive domain** — every resource that core needs is assigned to it at startup and never shared with other cores.
+
+```
+Shard (= 1 physical CPU core)
+  ├── Token range slice     — subset of the hash ring it owns
+  ├── Memtable              — its own in-memory write buffer
+  ├── SSTable file handles  — its own open file descriptors
+  ├── Row cache             — its own cache of hot rows
+  ├── CommitLog segment     — its own durability log
+  ├── Network queues        — NIC steers packets here via RSS
+  ├── I/O queues            — its own io_uring rings
+  └── Event loop            — single-threaded, runs forever, never sleeps
+```
+
+No two shards share any of these — no locks anywhere.
+
+**How data maps to a shard:**
+Every partition key is hashed to a token (0 to 2^64). The ring is divided among nodes, then each node's range is subdivided among its shards:
+```
+Node 1 owns: [0, 2^64/3)
+  └── Shard 0: [0,        2^64/12)
+  └── Shard 1: [2^64/12,  2^64/6)
+  └── Shard 2: [2^64/6,   2^64/4)
+  └── Shard 3: [2^64/4,   2^64/3)
+```
+A write for `pk=alice` → hash → token T → maps to Node 1 → maps to Shard 2 → Shard 2 handles it entirely.
+
+**Cross-shard hops:** if a packet lands on the wrong core (NIC steering miss), the core forwards it to the owning shard via a lock-free SPSC queue. Rare by design; drivers pin connections to minimize this.
+
+**Shard count = physical cores seen at startup.** Always allocate whole cores — fractional CPU (e.g., 3.5 cores) wastes a shard slot.
+
 ### Shard-per-Core (Seastar Framework)
 - Each CPU core is assigned a fixed subset of data (a "shard") and handles its own I/O, networking, and memory
 - Eliminates inter-thread locks and context switching
@@ -85,6 +148,144 @@ Response sent back
 | I/O model | Blocking threads | Async (never blocks) |
 | Throughput scaling | Sub-linear | Near-linear with core count |
 
+#### Async I/O: io_uring and Linux AIO
+
+**The problem with blocking I/O:**
+Traditional blocking I/O requires one thread per concurrent I/O operation — each blocked thread holds ~8 MB stack and causes OS context switches. This is the core bottleneck in thread-per-request systems like Cassandra.
+
+**Linux AIO (libaio) — older API:**
+```c
+io_submit(ctx, nr, iocbs);    // submit — returns immediately
+io_getevents(ctx, ...);       // later: check completions
+```
+Limitations: only works with `O_DIRECT`, can still block on metadata operations, file I/O only.
+
+**io_uring — modern API (Linux 5.1+, 2019):**
+Two shared ring buffers (mmap'd between user space and kernel) — no syscalls needed in polling mode:
+```
+User space                        Kernel space
+┌──────────────────┐             ┌──────────────────┐
+│ Submission Queue │ ──writes──▶ │  Process SQEs    │
+│ (SQ Ring)        │             │  issue to device │
+└──────────────────┘             └──────────────────┘
+┌──────────────────┐             ┌──────────────────┐
+│ Completion Queue │ ◀──writes── │  Write CQEs on   │
+│ (CQ Ring)        │             │  completion      │
+└──────────────────┘             └──────────────────┘
+```
+
+| | Linux AIO | io_uring |
+|---|---|---|
+| Buffered I/O | No (O_DIRECT only) | Yes |
+| Network I/O | No | Yes |
+| Truly non-blocking | No (can block on metadata) | Yes |
+| Syscall overhead | Per submission | Zero in polling mode |
+
+**How Seastar uses it:**
+Each core runs a single event loop that never blocks. io_uring is the mechanism that makes this possible:
+```
+Core N — Seastar event loop:
+  while true:
+    write pending SQEs → io_uring submission ring
+    read completed CQEs → fire continuations for each
+    poll NIC queues
+    run ready futures/coroutines
+    (never sleeps, never context-switches)
+```
+
+One core handles thousands of concurrent I/O operations. While one coroutine waits on disk, the event loop runs others:
+```cpp
+seastar::future<> handle_request() {
+    auto data = co_await read_file(path);   // suspends — core does other work
+    auto result = co_await process(data);   // resumes when I/O completes
+    co_await send_response(result);
+}
+```
+
+**Direct I/O (O_DIRECT):**
+ScyllaDB bypasses the OS page cache entirely — unpredictable page cache eviction causes latency spikes. ScyllaDB manages its own shard-aware row cache instead. Direct I/O requires 4096-byte aligned buffers; Seastar handles this internally.
+
+**I/O Scheduler (per shard):**
+Prioritises foreground over background to prevent compaction from starving reads/writes:
+```
+commitlog writes  ← highest
+memtable flushes  ← high
+reads             ← high
+compaction writes ← low
+repair streaming  ← lowest
+```
+
+**I/O calibration (`scylla_io_setup` / `iotune`):**
+Measures actual disk capabilities at install time (sequential throughput, random IOPS, latency) and configures queue depth and rate limits for that specific hardware.
+
+**io_uring vs libaio in ScyllaDB:**
+Seastar uses io_uring on kernels ≥ 5.1, falls back to libaio on older kernels.
+
+**Why this eliminates the threading problem:**
+```
+Cassandra: 1000 concurrent reads → 1000 threads → 1000 context switches, lock contention
+ScyllaDB:  1000 concurrent reads → 1 event loop → 1000 SQEs in ring
+             → kernel processes, writes CQEs → continuations fire on completion
+             → zero context switches, zero blocking, zero locks
+```
+
+#### How the I/O Scheduler Prioritizes Reads Over Compaction
+
+ScyllaDB implements a **userspace fair queue** in Seastar that sits between ScyllaDB code and the NVMe device. Prioritization happens before requests reach the device — the NVMe only sees pre-ordered requests.
+
+```
+ScyllaDB code
+     │
+     ▼
+Seastar I/O Scheduler  ← prioritization happens here (userspace)
+     │
+     ▼
+io_uring submission ring
+     │
+     ▼
+NVMe device (sees pre-prioritized requests)
+```
+
+**Mechanism: Weighted Fair Queue (shares-based)**
+
+Each I/O class has a shares value. The scheduler assigns a virtual finish time (vft) to every request:
+```
+vft = virtual_start_time + (request_cost / class_shares)
+```
+Lowest vft is dispatched first.
+
+```
+I/O Class           Shares   Effect
+commitlog           1000     highest priority (durability)
+memtable flush       400     high
+reads (queries)      200     preempts compaction
+compaction           100     lowest — scheduled last
+repair streaming      50     background only
+```
+
+Read vft = cost/200 (smaller) → scheduled before compaction vft = cost/100 (larger). Even with 100 pending compaction requests, a single arriving read is dispatched first.
+
+**Capacity model (iotune)**
+
+`scylla_io_setup` measures disk capabilities at install time (random IOPS, sequential bandwidth, optimal queue depth) and writes to `/etc/scylla.d/io.conf`. The scheduler uses these to set total I/O budget and max queue depth. Requests beyond the queue depth wait in Seastar's userspace queue — giving ScyllaDB full ordering control before anything reaches the NVMe.
+
+**Adaptive latency targeting**
+
+If read latency exceeds its target, the scheduler dynamically reduces compaction's shares until reads recover. When the disk is idle, compaction gets the full remaining budget — no waste.
+
+**Compaction bandwidth cap (hard limit)**
+```yaml
+# scylla.yaml
+compaction_throughput_mb_per_sec: 100   # 0 = unlimited
+```
+A ceiling on compaction I/O regardless of spare capacity. Lower in production if p99 spikes during compaction.
+
+**Why `none` I/O scheduler for NVMe?**
+OS schedulers (mq-deadline, cfq) were designed for HDDs to minimise seek time. NVMe has no rotational latency — setting `none` removes OS interference and hands full ordering control to Seastar.
+```bash
+echo none > /sys/block/nvme0n1/queue/scheduler
+```
+
 #### CPU Pinning Gotcha
 
 ScyllaDB pins each shard to a physical core at startup. In containers, it detects available cores and creates exactly that many shards. Always allocate **whole cores** — fractional CPU limits (e.g., 1.5 cores) waste a shard slot.
@@ -151,6 +352,41 @@ Tablets can also be **split** (tablet grows too large) or **merged** (tablet too
 | Cassandra support | Yes | No — ScyllaDB only |
 
 **Backwards compatibility:** tables created before ScyllaDB 6.x continue using vnodes; new tables default to tablets. Migration requires recreating tables.
+
+### Automatic Rebalancing
+
+#### Vnodes: semi-automatic (operator-triggered)
+
+ScyllaDB streams data automatically when a topology change is initiated, but does **not** proactively rebalance a live cluster without a trigger:
+
+```
+nodetool addnode        → auto-streams token ranges to new node ✓
+nodetool decommission   → auto-streams its data to remaining nodes ✓
+Live load imbalance     → nothing automatic ✗
+Hot partition           → nothing automatic ✗
+```
+
+After adding a node with vnodes, old nodes still hold data belonging to the new node — run cleanup to free it:
+
+```bash
+nodetool cleanup mykeyspace   # deletes data no longer owned by this node
+```
+
+#### Tablets: fully automatic (load balancer driven)
+
+The **tablet load balancer** runs continuously, monitoring distribution across nodes and shards:
+
+- **On node add:** migrates tablets one at a time to the new node — no cluster-wide I/O storm
+- **Live imbalance:** automatically migrates tablets from overloaded to underloaded nodes/shards
+- **Hot tablet:** auto-splits into two smaller tablets and places the halves on different nodes
+- **Tiny tablets:** auto-merges adjacent small tablets after data deletion
+- **Cleanup:** old tablet copies deleted automatically after migration
+
+No `nodetool cleanup` needed. Operator involvement is minimal — add the node, the balancer does the rest.
+
+#### Key difference
+
+With vnodes, the operator says "go rebalance" and ScyllaDB does it. With tablets, ScyllaDB continuously maintains balance on its own — the operator just adds/removes nodes and monitors.
 
 ### Replication
 - Data is replicated across N nodes (Replication Factor = RF)
@@ -977,6 +1213,121 @@ INSERT INTO mykeyspace.sessions (session_id, data)
 
 ---
 
+## Production Hardware Requirements
+
+ScyllaDB is designed to saturate hardware — it uses every CPU core, all available RAM, and pushes disk I/O to its limits. Hardware is the capacity plan: near-linear throughput scaling with cores means the spec sheet directly determines what the cluster can do.
+
+### CPU
+
+- **Minimum:** 4 physical cores
+- **Production:** 16–64 physical cores per node (32 is the sweet spot)
+- Allocate **whole cores only** — fractional CPU in containers wastes shard slots
+- High clock speed matters — ScyllaDB is CPU-bound on low-latency workloads
+- Hyperthreading: usable but each HT thread is half a physical core; disable for predictable latency
+- **Cloud:** AWS `i3en` family (includes local NVMe), GCP `n2-highmem`, Azure `Lsv3`
+
+### Memory
+
+- **Minimum:** 8 GB; **Production:** 64–256 GB per node
+- Rule of thumb: **2 GB per core minimum, 4–8 GB per core preferred**
+- ScyllaDB allocates memory at startup (own allocator, not OS heap) — prevents GC-like pauses
+- Leave 20–30% headroom for compaction spikes
+- **Disable swap** — a swapped ScyllaDB node is worse than a crashed one (catastrophic latency)
+
+### Storage
+
+Storage is the most critical dimension.
+
+| Type | Random IOPS | Latency | Verdict |
+|---|---|---|---|
+| Local NVMe SSD | 500k–1M+ | 20–100 μs | **Strongly preferred** |
+| SATA SSD | 50k–100k | 100–500 μs | Acceptable |
+| HDD | 100–200 | 5–10 ms | Avoid |
+| Network-attached (EBS, NFS) | Variable | ms-level spikes | Avoid for data |
+
+```
+Disk layout (recommended):
+  /var/lib/scylla/data      → NVMe SSD  (data directory)
+  /var/lib/scylla/commitlog → separate NVMe (prevents compaction I/O competing with CommitLog)
+  /var/lib/scylla/hints     → same disk as data is fine
+```
+
+**Sizing:** `disk = (data per node) × 2.5` (accounts for space amplification during compaction)
+
+**RAID:** use RAID 0 (striping) for more IOPS across multiple NVMe drives. RAID 1/5/6 not needed — ScyllaDB replication is your redundancy, not RAID.
+
+**Filesystem:** XFS strongly recommended (`noatime,nodiratime`). Avoid btrfs/ZFS — copy-on-write semantics conflict with ScyllaDB's I/O model.
+
+### Network
+
+- **Minimum:** 1 GbE; **Production:** 10 GbE; **High throughput:** 25 GbE+
+- Replication bandwidth: `write throughput × (RF - 1)` — at 500 MB/s writes with RF=3, replication alone needs 1 GB/s
+- In large clusters: separate NICs for client traffic vs internal cluster traffic
+- Required ports: `9042` (CQL), `7000` (inter-node), `7001` (inter-node TLS), `9180` (Prometheus), `10000` (REST API)
+
+### OS Tuning (applied by `scylla_setup`)
+
+```bash
+# CPU: performance governor (no frequency scaling)
+echo performance > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Memory: disable transparent huge pages (causes allocator latency spikes)
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+# Swap: must be off
+swapoff -a
+
+# I/O scheduler: 'none' for NVMe (has its own queue), 'mq-deadline' for SATA SSD
+echo none > /sys/block/nvme0n1/queue/scheduler
+
+# I/O calibration (auto-tunes ScyllaDB's I/O scheduler for your specific disk)
+scylla_io_setup
+```
+
+### Reference Specs
+
+| Tier | CPU | RAM | Storage | Network |
+|---|---|---|---|---|
+| Minimum production | 16 cores | 64 GB | 2× NVMe 1–2 TB + separate commitlog | 10 GbE |
+| High performance | 64 cores | 256–512 GB | 4× NVMe RAID 0 6–8 TB | 25 GbE |
+
+### Why Memory Matters Even With NVMe
+
+Even with NVMe (20–100 μs latency), RAM is ~1000x faster:
+
+```
+RAM access:   ~100 nanoseconds
+NVMe access:  ~20,000–100,000 nanoseconds (20–100 μs)
+```
+
+| Memory role | What happens without enough |
+|---|---|
+| **Row cache** | Every read hits NVMe instead of RAM — 1000x slower per access |
+| **Memtable** | Frequent small flushes → more SSTables → higher read amplification → more NVMe reads per query |
+| **Bloom filters + Index/Summary** | Evicted from RAM → every read starts touching NVMe unnecessarily |
+| **Compaction** | Low memory → small flushes → SSTables pile up → compaction I/O competes with reads/writes on NVMe |
+| **Per-shard budget** | Each shard gets a RAM slice — too small → constant flushing even on fast NVMe |
+
+**Mental model:** NVMe sets the *floor* (makes disk fast when you must hit it). Memory sets the *ceiling* (determines how often you hit disk at all). A well-sized cluster serves 90%+ of reads from cache — NVMe speed barely matters for those reads.
+
+This is why ScyllaDB recommends 4–8 GB per core — it's about keeping hot data off disk entirely, not about OS overhead.
+
+### Things That Kill ScyllaDB Performance
+
+```
+❌ Network-attached storage for data (EBS, NFS) — ms-level latency spikes
+❌ Transparent huge pages enabled — allocator latency spikes
+❌ Swap enabled — catastrophic latency; disable entirely
+❌ CPU frequency scaling (powersave governor) — inconsistent shard timing
+❌ Fractional CPU in containers — wasted shard slots
+❌ Burstable cloud instances (t3/t4g) — CPU throttling destroys p99
+❌ HDD storage — random IOPS ~200 vs NVMe 500k+
+❌ Shared noisy-neighbour workloads on same node
+```
+
+---
+
 ## RPO and RTO
 
 **RPO (Recovery Point Objective):** how much data can be lost — measured as time (e.g., "at most 5 minutes of writes").
@@ -1156,6 +1507,689 @@ Under-replication has five forms: pending hints, expired-hint gaps, replica dive
 **Q: What happens when a node dies?**
 Detection takes 10–30 seconds via the phi accrual failure detector (gossip-based). Once marked DOWN, coordinators stop routing to it and begin hinting writes to its token ranges. With RF=3 and LOCAL_QUORUM, reads and writes continue unaffected on surviving replicas — clients see no errors. If the node recovers within 3 hours: CommitLog replays pre-crash state, gossip detects UP, hints replay automatically — fully self-healing. If down > 3h: hints expired, a data gap exists — run `nodetool repair` after recovery. If permanently lost: bootstrap a replacement with `--replace-address` which streams the dead node's data from surviving replicas, then run repair to validate.
 
+**Q: Does ScyllaDB automatically rebalance data?**
+With vnodes (pre-6.x): semi-automatic — ScyllaDB streams data automatically when a topology change is operator-triggered (`nodetool addnode`, `decommission`), but does nothing about live load imbalance or hot partitions without intervention. Must also run `nodetool cleanup` after adding nodes to free stale data from old owners. With tablets (ScyllaDB 6.x+): fully automatic — the tablet load balancer continuously monitors distribution and migrates tablets from overloaded to underloaded nodes/shards, auto-splits hot/large tablets, auto-merges small tablets, and cleans up old copies after migration. Adding a node with tablets requires no manual steps beyond initiating the join.
+
+**Q: What are the production hardware requirements?**
+ScyllaDB saturates hardware — specs directly determine capacity. CPU: 16–64 physical whole cores (32 is sweet spot); near-linear throughput scaling with cores. RAM: 64–256 GB; 2 GB/core minimum, 4–8 GB/core preferred; disable swap entirely. Storage: local NVMe SSD strongly preferred (500k+ random IOPS, 20–100μs latency) — network-attached storage (EBS/NFS) causes ms-level latency spikes that destroy p99; size at `data × 2.5` for space amplification; separate disk for CommitLog; XFS filesystem; RAID 0 for striping across multiple NVMe drives. Network: 10 GbE minimum (25 GbE for high throughput). OS tuning via `scylla_setup`: performance CPU governor, disable THP, disable swap, calibrate I/O scheduler with `scylla_io_setup`. Key killers: THP, swap, network-attached storage, fractional CPU, burstable instances, CPU frequency scaling.
+
+---
+
+## Recommended AWS Instance Types
+
+ScyllaDB's AWS instance selection is driven by three hard requirements: **local NVMe storage** (no EBS), **whole physical cores**, and **no burstable CPU**. The instance family determines all three.
+
+### Primary: i3en (ScyllaDB's top recommendation)
+
+Intel-based, local NVMe, high memory-to-core ratio. The workhorse family for production ScyllaDB.
+
+| Instance | vCPU | RAM | Local NVMe | Network |
+|---|---|---|---|---|
+| i3en.xlarge | 4 | 32 GB | 1.25 TB (1×) | Up to 25 Gbps |
+| i3en.2xlarge | 8 | 64 GB | 2.5 TB (1×) | Up to 25 Gbps |
+| i3en.3xlarge | 12 | 96 GB | 7.5 TB (2×) | Up to 25 Gbps |
+| i3en.6xlarge | 24 | 192 GB | 15 TB (2×) | 25 Gbps |
+| i3en.12xlarge | 48 | 384 GB | 30 TB (2×) | 50 Gbps |
+| i3en.24xlarge | 96 | 768 GB | 60 TB (2×) | 100 Gbps |
+
+**Sweet spot:** `i3en.6xlarge` or `i3en.12xlarge` — 24–48 vCPUs, enough RAM, two NVMe drives to separate data and CommitLog.
+
+**Memory ratio:** i3en gives 8 GB/vCPU — exceeds the 4–8 GB/core recommendation.
+
+### Secondary: i4i (newer generation, higher IOPS)
+
+Intel Ice Lake with NVMe, up to 40% better price/performance than i3.
+
+| Instance | vCPU | RAM | Local NVMe | NVMe IOPS |
+|---|---|---|---|---|
+| i4i.xlarge | 4 | 32 GB | 937 GB (1×) | 200k read / 100k write |
+| i4i.2xlarge | 8 | 64 GB | 1.875 TB (1×) | 400k / 200k |
+| i4i.4xlarge | 16 | 128 GB | 3.75 TB (1×) | 800k / 400k |
+| i4i.8xlarge | 32 | 256 GB | 7.5 TB (2×) | 1.6M / 800k |
+| i4i.16xlarge | 64 | 512 GB | 15 TB (4×) | 3.2M / 1.6M |
+| i4i.32xlarge | 128 | 1024 GB | 30 TB (8×) | 6.4M / 3.2M |
+
+**Choose i4i over i3en when:** you need maximum IOPS or are starting a new cluster — better hardware for the same price. The multiple NVMe drives on larger sizes allow striping or CommitLog separation.
+
+### i3 (older, still common)
+
+Prior generation but widely deployed. Lower memory ratio (7.6 GB/vCPU).
+
+| Instance | vCPU | RAM | Local NVMe |
+|---|---|---|---|
+| i3.xlarge | 4 | 30.5 GB | 950 GB (1×) |
+| i3.2xlarge | 8 | 61 GB | 1.9 TB (1×) |
+| i3.4xlarge | 16 | 122 GB | 3.8 TB (2×) |
+| i3.8xlarge | 32 | 244 GB | 6.4 TB (4×) |
+| i3.16xlarge | 64 | 488 GB | 12.8 TB (8×) |
+
+Still valid; upgrade path is i3 → i4i.
+
+### is4gen / im4gn (Graviton2 — ARM, cost-optimized)
+
+AWS Graviton2-based instances with local NVMe. 20–40% lower cost than equivalent Intel.
+
+| Family | Focus | Trade-off |
+|---|---|---|
+| `is4gen` | Storage-dense (up to 30 TB NVMe) | Less RAM per vCPU |
+| `im4gn` | Memory-optimised + NVMe | Balanced |
+
+**Use if:** you have validated ARM compatibility in your driver/app stack and are cost-sensitive. ScyllaDB supports Graviton officially.
+
+### Instance Selection Decision Tree
+
+```
+Do you need local NVMe? (Always yes for data directory)
+  └── YES: use i3en / i4i / i3 / is4gen / im4gn
+      │
+      ├── New cluster, prefer best price/perf → i4i
+      ├── Large storage (>10 TB/node)        → i3en or i3.8xlarge+
+      ├── Cost optimisation, ARM OK          → is4gen / im4gn
+      └── Existing i3 cluster               → stay i3 or migrate to i4i
+
+Node size guidance:
+  Dev/staging       → i3en.2xlarge  (8 vCPU, 64 GB)
+  Production (min)  → i3en.3xlarge or i4i.4xlarge (12–16 vCPU)
+  Production (std)  → i3en.6xlarge or i4i.8xlarge (24–32 vCPU) ← sweet spot
+  High throughput   → i3en.12xlarge or i4i.16xlarge (48–64 vCPU)
+```
+
+### Instance Types to Avoid
+
+| Instance Family | Reason |
+|---|---|
+| `t3`, `t4g` (burstable) | CPU throttling destroys p99 latency — hard no |
+| `m5`, `m6i`, `r5`, `r6i` | No local NVMe — requires EBS; ms-level I/O spikes |
+| `c5`, `c6i` (compute-optimized) | Low memory ratio; no local storage |
+| Any EBS-backed instance | EBS `gp3` gives ~16k IOPS vs NVMe's 500k+ — 30× worse |
+
+### Multi-Volume Layout on i4i.8xlarge (example)
+
+```
+i4i.8xlarge: 2× NVMe drives (7.5 TB total)
+
+  /dev/nvme1n1  →  mount /var/lib/scylla/data        (XFS, noatime)
+  /dev/nvme2n1  →  mount /var/lib/scylla/commitlog   (XFS, noatime)
+
+No RAID needed — ScyllaDB replication is the redundancy.
+Separate disks prevent compaction I/O from starving CommitLog writes.
+```
+
+### EBS: When It Is Acceptable
+
+| Use | Acceptable? |
+|---|---|
+| Data directory (`/var/lib/scylla/data`) | **No** — latency spikes unacceptable |
+| CommitLog (`/var/lib/scylla/commitlog`) | **No** — sequential writes hurt less but still risky |
+| OS / system disk | **Yes** — not on the hot path |
+| Backup staging (S3 upload buffer) | **Yes** |
+| Dev/test clusters with no SLA | **Tolerable** |
+
+`gp3` EBS can deliver up to 16,000 IOPS — compared to i4i's 800k+ IOPS this is ~50× slower at equal cost. Never use it for the data path in production.
+
+### Summary
+
+| Priority | Instance | Why |
+|---|---|---|
+| Best overall | **i4i.8xlarge** (32c/256GB) | Newest gen, highest IOPS, two NVMe drives |
+| Best storage density | **i3en.12xlarge** (48c/384GB) | 30 TB NVMe, 50 Gbps |
+| Budget / ARM | **im4gn.8xlarge** | Graviton2, 20–40% cheaper |
+| Never | **t3/t4g or EBS-backed** | Burstable CPU or network storage |
+
+---
+
+## Backups
+
+### Option 1: ScyllaDB Manager (recommended)
+
+ScyllaDB Manager handles scheduling, parallel uploads to S3/GCS/Azure, retention, rate limiting, and incremental backups.
+
+**Architecture:**
+```
+ScyllaDB Manager Server  (separate host)
+        │
+        │ port 5090
+        ▼
+Manager Agent  (runs on every ScyllaDB node)
+```
+
+**Schedule a 6-hour backup:**
+```bash
+# Add cluster to Manager
+sctool cluster add \
+  --host <any-scylla-node-ip> \
+  --name mycluster
+
+# Create a backup task on a 6-hour cron
+sctool backup \
+  --cluster mycluster \
+  --location s3:my-bucket/scylla-backups \
+  --cron "0 */6 * * *" \
+  --retention 7d \
+  --rate-limit 50 \        # MB/s per shard — throttle to avoid I/O competition
+  --name "6h-backup"
+
+# Check scheduled tasks
+sctool task list --cluster mycluster
+
+# Check backup status / history
+sctool backup/status --cluster mycluster --show-tables
+```
+
+**Incremental backups** (only upload changed SSTables — much faster after first run):
+```bash
+sctool backup \
+  --cluster mycluster \
+  --location s3:my-bucket/scylla-backups \
+  --cron "0 */6 * * *" \
+  --retention 7d \
+  --method incremental
+```
+
+### Option 2: nodetool snapshot + cron (no Manager)
+
+`nodetool snapshot` creates a point-in-time snapshot using hard links — lightweight and fast. Upload to S3 separately.
+
+```bash
+# Snapshots land here (hard links to SSTable files)
+/var/lib/scylla/data/<keyspace>/<table>/snapshots/<tag>/
+
+nodetool listsnapshots          # list all snapshots
+nodetool clearsnapshot -t <tag> # clear after upload — mandatory
+```
+
+**Cron script for 6-hour automated backup:**
+```bash
+# /etc/cron.d/scylla-backup
+0 */6 * * * root /usr/local/bin/scylla-backup.sh
+```
+
+```bash
+#!/bin/bash
+TAG=$(date +%Y%m%d-%H%M%S)
+
+nodetool flush                  # flush memtable to disk first
+nodetool snapshot -t "$TAG"
+
+aws s3 sync /var/lib/scylla/data/ s3://my-bucket/scylla-backups/$TAG/ \
+  --exclude "*" \
+  --include "*/snapshots/$TAG/*"
+
+nodetool clearsnapshot -t "$TAG"
+```
+
+### Key Considerations
+
+**nodetool flush before snapshot** — snapshots capture SSTables only; data still in memtable is not included. Flush ensures all writes are on disk before snapshotting.
+
+**Snapshot cleanup is mandatory** — snapshots are hard links that prevent SSTable files from being deleted by compaction. If not cleared, NVMe fills up silently.
+
+**Rate limit uploads** — uploading to S3 competes with compaction and replication for I/O. Use Manager's `--rate-limit` or `aws s3 sync --bandwidth` flag.
+
+**Multi-node: every node must be backed up** — each node holds only its token ranges. ScyllaDB Manager handles this automatically; with cron you must run on every node.
+
+### Comparison
+
+| | ScyllaDB Manager | nodetool + cron |
+|---|---|---|
+| Setup complexity | Medium (separate server) | Low |
+| Incremental backup | Yes | No (always full) |
+| Multi-node coordination | Automatic | Manual (run on each node) |
+| Rate limiting | Built-in | Manual |
+| Retention management | Built-in | Manual |
+| Restore tooling | Built-in (`sctool restore`) | Manual |
+| Best for | Production | Dev/staging or simple setups |
+
+### Restore
+
+#### How Backup Works Internally (Snapshots, Hard Links, Upload)
+
+**Step 1 — Flush memtable**
+Before snapshotting, ScyllaDB flushes the memtable to disk so the snapshot captures all acknowledged writes. Data still only in RAM would be missed.
+
+**Step 2 — Hard link creation (the snapshot)**
+`nodetool snapshot` does not copy data. It creates a snapshot directory and makes hard links to every current SSTable file:
+
+```
+Before snapshot:
+  data/mykeyspace/users/
+    ├── ma-1-big-Data.db     (inode 1001, link count: 1)
+    └── ma-1-big-Filter.db   (inode 1003, link count: 1)
+
+After snapshot (tag=20240501):
+  data/mykeyspace/users/
+    ├── ma-1-big-Data.db     (inode 1001, link count: 2)  ← same inode
+    └── snapshots/20240501/
+          └── ma-1-big-Data.db    → inode 1001  (no data copied)
+```
+
+Hard link = new directory entry pointing to the same inode. No data is copied — snapshot creation is nearly instantaneous regardless of dataset size (a 1 TB node snapshots in milliseconds).
+
+**Step 3 — Hard links and compaction**
+When compaction merges `A + B → C` and deletes `A` and `B` from the live directory, the inodes are not freed — the snapshot's hard links still hold a reference. The OS only frees disk space when ALL hard links to an inode are removed (link count = 0).
+
+```
+t=0: snapshot created → inode 1001 link count: 2
+t=1: compaction deletes live/A → link count: 1 (snapshot still holds it)
+t=2: clearsnapshot → link count: 0 → OS frees disk space
+```
+
+**Disk space impact:**
+```
+t=0: A(100MB) + B(200MB) = 300MB
+t=1: snapshot created       → still 300MB  (hard links are free)
+t=2: compaction A+B→C(250MB) → 550MB  (snap pins A+B, C is new)
+t=3: clearsnapshot          → 250MB   (A+B inodes released)
+```
+Uncleaned snapshots silently fill NVMe — `clearsnapshot` after upload is mandatory.
+
+**Step 4 — Upload to S3**
+Files are uploaded from the snapshot directory, then cleared:
+```bash
+aws s3 sync /var/lib/scylla/data/ s3://bucket/backups/<tag>/ \
+  --include "*/snapshots/<tag>/*"
+nodetool clearsnapshot -t <tag>
+```
+ScyllaDB Manager parallelises across nodes/shards, rate-limits bandwidth, and tracks a manifest of uploaded files for incremental backups.
+
+**Step 5 — Incremental backups (ScyllaDB Manager)**
+SSTables are immutable with unique names (generation IDs). Manager exploits this:
+```
+Backup run 1: SSTables A, B, C → upload all → manifest: {A, B, C}
+Compaction: A+B → D; new writes: E, F
+Backup run 2: snapshot has C, D, E, F
+  → C in manifest → skip
+  → D, E, F not in manifest → upload only these 3
+  → manifest: {A, B, C, D, E, F}
+```
+First backup is full; every subsequent run uploads only new SSTables.
+
+**CommitLog is NOT included**
+Snapshots capture SSTables only. `nodetool flush` before snapshot ensures all acknowledged writes are in SSTables. ScyllaDB Enterprise supports CommitLog archival for true point-in-time recovery (PITR).
+
+**Full flow:**
+```
+nodetool flush → memtable → SSTables on NVMe
+      ↓
+nodetool snapshot → hard links in snapshots/TAG/ (instantaneous)
+      ↓
+upload snapshots/TAG/ → S3 (parallel, rate-limited)
+      ↓
+nodetool clearsnapshot → link count → 0 → OS frees disk
+```
+
+#### Option 1: ScyllaDB Manager restore
+
+```bash
+# List available backups
+sctool backup/list --cluster mycluster --location s3:my-bucket/scylla-backups
+
+# Restore entire cluster from a snapshot tag
+sctool restore \
+  --cluster mycluster \
+  --location s3:my-bucket/scylla-backups \
+  --snapshot-tag sm_20240501120000UTC \
+  --restore-tables
+
+# Restore schema only (no data)
+sctool restore \
+  --cluster mycluster \
+  --location s3:my-bucket/scylla-backups \
+  --snapshot-tag sm_20240501120000UTC \
+  --restore-schema
+
+# Monitor progress
+sctool restore/progress --cluster mycluster
+```
+
+Manager downloads SSTables to each node, loads them, and coordinates across the cluster automatically.
+
+#### Option 2: Manual restore via sstableloader
+
+`sstableloader` streams SSTables into a live cluster respecting the current token ring — preferred over raw file copy because it works even if the new cluster has different topology/node count.
+
+**Full cluster restore:**
+```bash
+# 1. Bootstrap new cluster with same schema
+# 2. Download snapshot from S3
+aws s3 sync s3://my-bucket/scylla-backups/<tag>/ /var/lib/scylla/data/
+
+# 3. Stream into cluster (run per table)
+sstableloader \
+  -d <any-node-ip> \
+  /var/lib/scylla/data/<keyspace>/<table>/
+
+# 4. Validate
+nodetool repair mykeyspace
+```
+
+**Single table restore (accidental TRUNCATE / DROP — cluster stays up):**
+```bash
+# 1. Recreate table schema if dropped
+cqlsh -e "CREATE TABLE mykeyspace.users (...)"
+
+# 2. Download just that table's snapshot
+aws s3 sync \
+  s3://my-bucket/scylla-backups/<tag>/mykeyspace/users/ \
+  /tmp/restore/mykeyspace/users/
+
+# 3. Stream into live cluster — no downtime
+sstableloader -d <node-ip> /tmp/restore/mykeyspace/users/
+```
+
+#### Restore Scenarios
+
+| Scenario | Approach | Downtime? |
+|---|---|---|
+| Accidental TRUNCATE / DROP TABLE | sstableloader into live cluster | None |
+| Single node lost (RF=3) | No restore needed — replication covers it | None |
+| Full cluster loss | Bootstrap new cluster + sstableloader from S3 | Yes |
+| Corruption on one node | `--replace-address` first, then repair | Minimal |
+| Point-in-time restore | Restore schema + sstableloader from that tag | Depends on scope |
+
+#### Gotchas
+
+**Tombstones win over restored data** — if a row was deleted after the snapshot, the tombstone on other replicas still wins after read repair/compaction. Restore quickly, before `gc_grace_seconds` (10 days) expires and tombstones are purged — otherwise the deleted row resurrects permanently.
+
+**Schema must exist before data** — `sstableloader` requires the keyspace and table to already exist. Restore schema first, then data.
+
+**Clock skew on restored data** — restored SSTables carry original write timestamps. Live writes after the snapshot time will not be overwritten by the restore (LWW — higher timestamp wins).
+
+**Verify after restore:**
+```bash
+nodetool repair mykeyspace users   # reconcile divergence
+nodetool verify mykeyspace users   # checksum validation of SSTable files
+```
+
+---
+
+## Monitoring: VictoriaMetrics Integration
+
+ScyllaDB exposes Prometheus-format metrics on port `9180`. VictoriaMetrics scrapes any Prometheus-compatible endpoint — so the integration works via the standard Prometheus scrape protocol with no custom plugins needed.
+
+### Setup Options
+
+**Option 1: vmagent scrapes ScyllaDB directly (fewest moving parts)**
+```yaml
+scrape_configs:
+  - job_name: 'scylladb'
+    static_configs:
+      - targets:
+          - 'node1:9180'
+          - 'node2:9180'
+          - 'node3:9180'
+```
+`vmagent` scrapes → sends to VictoriaMetrics storage.
+
+**Option 2: Prometheus scrapes ScyllaDB → remote_write to VictoriaMetrics**
+```yaml
+remote_write:
+  - url: http://victoria-metrics:8428/api/v1/write
+```
+More components but familiar if Prometheus is already in the stack.
+
+### Official ScyllaDB Monitoring Stack
+
+ScyllaDB ships `scylla-monitoring` (GitHub) with pre-built Prometheus scrape configs and Grafana dashboards covering per-shard CPU, latency percentiles, compaction, cache hit rate, and hints.
+
+VictoriaMetrics can replace Prometheus in this stack — it exposes a Prometheus-compatible query API so existing Grafana dashboards work unchanged. VictoriaMetrics' MetricsQL is a superset of PromQL.
+
+### Key Metrics to Watch
+
+| Metric | What it tells you |
+|---|---|
+| `scylla_reactor_utilization` | CPU utilization per shard |
+| `scylla_storage_proxy_coordinator_write_latency` | Write latency (p50/p99) |
+| `scylla_storage_proxy_coordinator_read_latency` | Read latency (p50/p99) |
+| `scylla_hints_manager_hints_in_progress` | Under-replication signal |
+| `scylla_cache_row_hits` / `scylla_cache_row_misses` | Row cache hit rate |
+| `scylla_compaction_manager_compactions` | Active compaction count |
+| `scylla_transport_requests_served` | CQL request throughput |
+
+### Caveats
+
+- ScyllaDB's official alerting rules are written for Prometheus — minor syntax adjustments may be needed for MetricsQL (mostly compatible but not identical)
+- Test alert rules before relying on them in production when switching from Prometheus to VictoriaMetrics
+
+### Collectors and Exporters
+
+#### Built-in (no separate exporter needed)
+
+ScyllaDB ships with a built-in Prometheus exporter — no sidecar, no agent:
+
+```
+http://<node>:9180/metrics   ← ready out of the box
+```
+
+Exposes thousands of metrics across CPU (per shard), latency, cache, compaction, hints, CQL transport, storage, repair, and streaming.
+
+#### Official ScyllaDB Tools
+
+| Tool | Port | Purpose |
+|---|---|---|
+| Built-in Prometheus endpoint | `9180` | All database internals — primary metrics source |
+| `scylla-jmx` | `7199` | JMX proxy — translates JMX calls to REST API; enables `nodetool` and Cassandra-era tooling |
+| ScyllaDB Manager Agent | `5090` | Backup, repair scheduling, health reporting; exposes its own metrics |
+| `scylla-monitoring` stack | — | Pre-wired Prometheus + Grafana + Alertmanager stack (GitHub: `scylladb/scylla-monitoring`) |
+
+#### OS-level (deploy alongside ScyllaDB)
+
+| Exporter | Port | What it adds |
+|---|---|---|
+| `node_exporter` (Prometheus) | `9100` | CPU, memory, disk I/O, network — host-level metrics not covered by `:9180` |
+
+Essential for full observability — `:9180` covers database internals; `node_exporter` covers the host.
+
+#### Ecosystem Scrapers (all scrape `:9180`)
+
+| Tool | How |
+|---|---|
+| **vmagent** (VictoriaMetrics) | Prometheus scrape_config → VictoriaMetrics storage |
+| **Grafana Agent / Alloy** | Prometheus scrape → Grafana Cloud or any remote_write target |
+| **OpenTelemetry Collector** | `prometheusreceiver` scrapes `:9180` → any OTLP backend |
+| **Telegraf** (InfluxData) | `prometheus` input plugin → InfluxDB or any output |
+| **Datadog Agent** | Built-in ScyllaDB integration — scrapes `:9180`, maps to Datadog metrics |
+
+#### Metric Categories from `:9180`
+
+| Category | Example metrics |
+|---|---|
+| CPU (per shard) | `scylla_reactor_utilization` |
+| Write latency | `scylla_storage_proxy_coordinator_write_latency` |
+| Read latency | `scylla_storage_proxy_coordinator_read_latency` |
+| Row cache | `scylla_cache_row_hits`, `scylla_cache_row_misses` |
+| Compaction | `scylla_compaction_manager_compactions` |
+| Hints | `scylla_hints_manager_hints_in_progress` |
+| CQL transport | `scylla_transport_requests_served` |
+| Repair | `scylla_repair_*` |
+| Streaming | `scylla_streaming_*` |
+| SSTables | `scylla_sstables_*` |
+
+---
+
+## Ports Reference
+
+### Client-facing (app servers → ScyllaDB nodes)
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| `9042` | TCP | CQL — all application traffic |
+| `9142` | TCP | CQL over TLS — use instead of 9042 when encryption in transit is required |
+| `9160` | TCP | Thrift — legacy Cassandra protocol; deprecated, avoid in new deployments |
+
+Open `9042` (or `9142`) from your application tier only — never to the public internet.
+
+### Inter-node (ScyllaDB nodes ↔ ScyllaDB nodes)
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| `7000` | TCP | Gossip, streaming (repair, bootstrap, rebalancing), inter-node RPC |
+| `7001` | TCP | Same as 7000 but TLS-encrypted |
+
+Must be open between all nodes in the cluster, including across AZs and regions in multi-DC setups. If 7000 is blocked between DCs, replication silently stops.
+
+### Monitoring & Management
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| `9180` | TCP | Prometheus metrics scrape endpoint |
+| `10000` | TCP | ScyllaDB REST API — used by `nodetool`, ScyllaDB Manager, admin operations |
+
+`10000` should only be open to your ops/monitoring subnet — it exposes cluster management operations.
+
+### ScyllaDB Manager (if deployed)
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| `5090` | TCP | Manager agent (runs on each ScyllaDB node, talks to Manager server) |
+| `5112` | TCP | Manager server HTTP API |
+
+### AWS Security Group Summary
+
+```
+App servers      → ScyllaDB nodes:   9042 (or 9142 for TLS)
+ScyllaDB nodes  ↔ each other:        7000, 7001
+Monitoring server → nodes:           9180, 10000
+ScyllaDB Manager  → nodes:           5090
+Public internet:                     nothing — no ports open
+```
+
+### Common Mistakes
+
+- **Forgetting 7000 across AZs** — replication breaks silently; `nodetool status` shows nodes as UN but data diverges
+- **Exposing 9042 to 0.0.0.0** — CQL has no built-in rate limiting; open to the internet = instant attack surface
+- **Forgetting 10000** — `nodetool` and ScyllaDB Manager fail with connection refused
+- **Opening 9160 (Thrift)** — unnecessary in modern deployments, increases attack surface
+
+---
+
+## Optimizing Write-Heavy Workloads
+
+Write-heavy optimization is a series of trade-offs — every knob you turn to gain write throughput gives up something else.
+
+### 1. Consistency Level — biggest lever, biggest risk
+
+Drop from `LOCAL_QUORUM` to `LOCAL_ONE`:
+- Coordinator acks after 1 replica instead of waiting for majority
+- 2–3x lower write latency, higher throughput
+
+**Risk:**
+```
+Write at LOCAL_ONE:
+  Replica 1 ✓ ← acked to client
+  Replica 2, 3 ← replication in-flight
+
+Coordinator crashes before replication completes → data loss
+Replica 1 goes down before Replica 2/3 catch up → data loss
+```
+Only use `LOCAL_ONE` for data where occasional loss is acceptable (logs, IoT events, metrics).
+
+### 2. Compaction Strategy
+
+**Use STCS (Size-Tiered) — default, best for writes:**
+- Merges SSTables only when enough of similar size accumulate → low write amplification
+- ScyllaDB-specific **ICS (Incremental)** further reduces space amplification over STCS
+
+**Avoid LCS for write-heavy** — Leveled Compaction maintains strict level structure → more compaction work per write → higher write amplification.
+
+**Risk with STCS:**
+- Space amplification up to 50% — need more disk headroom
+- More SSTables accumulate between compactions → reads get slower (more bloom filter checks, more SSTable merges)
+- Monitor read latency carefully on mixed read/write workloads
+
+**For time-series (append-only by time) — use TWCS:**
+- Compacts within time buckets; when a window closes, the whole SSTable expires — no tombstone accumulation
+- Risk: only works if writes are strictly time-ordered within a partition; out-of-order writes into closed windows cause compaction problems
+
+### 3. CommitLog Sync Mode
+
+```yaml
+commitlog_sync: periodic   # fsync every 10s — fast, default
+commitlog_sync: batch      # fsync on every write — safe, 2–5x slower
+```
+
+**Risk of `periodic`:** up to 10 seconds of writes lost on power failure / kernel crash. Mitigated by RF — replication across nodes/AZs provides durability even if one node crashes. Only use `batch` when strict single-node durability is required.
+
+### 4. Memtable Size
+
+Increase `memtable_total_space_in_mb`:
+- Larger memtable absorbs more writes before flushing → fewer SSTables → less compaction → less read amplification
+
+**Risk:**
+- Every MB given to memtable is taken from row cache
+- If set too high → OOM on compaction spikes (compaction needs its own memory buffer)
+- Rule: memtable + row cache + compaction buffers must fit within ScyllaDB's allocated RAM
+
+### 5. Batching — use carefully
+
+`UNLOGGED BATCH` for writes to the **same partition** only:
+```cql
+BEGIN UNLOGGED BATCH
+  INSERT INTO events (pk, ts, val) VALUES ('user1', now(), 'a');
+  INSERT INTO events (pk, ts, val) VALUES ('user1', now(), 'b');
+APPLY BATCH;
+```
+
+**Risk:**
+```
+Good: UNLOGGED BATCH → same partition key
+  → coordinator handles locally → fast
+
+Bad: UNLOGGED BATCH → many different partition keys
+  → coordinator collects all writes, fans out to many nodes
+  → coordinator becomes a hotspot — defeats shard-per-core
+  → worse than individual writes under load
+```
+`LOGGED BATCH` uses Paxos — avoid entirely for write-heavy paths.
+
+### 6. Avoid Lightweight Transactions (LWT)
+
+LWT (`IF NOT EXISTS`, `IF col = val`) uses 4 Paxos round trips → ~4x slower than a normal write. Design schema so writes don't need uniqueness checks.
+
+**Risk:** Removing LWT where the schema actually needs a uniqueness guarantee → duplicate or conflicting rows silently survive. Verify the data contract allows it before removing.
+
+### 7. Driver-Level Async Writes
+
+```python
+# Bad — sequential, one at a time
+for row in rows:
+    session.execute(stmt, row)   # blocks until ack
+
+# Good — async, many in-flight
+futures = [session.execute_async(stmt, row) for row in rows]
+for f in futures:
+    f.result()   # collect after sending all
+```
+
+**Risk:** Silent error swallowing — a failed write in a batch of async futures requires per-future error checking; naive implementations drop errors silently.
+
+### 8. Partition Key Design — the silent killer
+
+High-cardinality, evenly distributed partition key → all shards on all nodes absorb writes in parallel → near-linear throughput scaling.
+
+**Risk of hot partition:**
+```
+pk = "us-east-1"  ← all US writes to one partition
+  → one shard on one node handles all US writes
+  → that shard saturates; rest of cluster idles
+  → adding nodes does nothing
+```
+Hot partitions cannot be fixed by scaling — only schema redesign fixes them. With tablets (v6+) a hot tablet can auto-split, but only if the partition key has enough cardinality to spread across the split halves.
+
+### Risk Summary
+
+| Optimization | Write gain | Risk |
+|---|---|---|
+| `LOCAL_ONE` vs `LOCAL_QUORUM` | High | Data loss if node down before async replication |
+| STCS / ICS over LCS | Medium | Space amplification; reads slow as SSTables pile up |
+| TWCS for time-series | High | Out-of-order writes into closed windows corrupt compaction |
+| `commitlog_sync: periodic` | High | Up to 10s data loss on crash (mitigated by RF) |
+| Larger memtable | Medium | Less row cache; OOM risk on compaction spike |
+| `UNLOGGED BATCH` (same partition) | Medium | Misuse across partitions creates coordinator hotspot |
+| Remove LWT | High | Duplicate/conflicting writes if uniqueness was needed |
+| Async driver writes | High | Silent error swallowing if not handled carefully |
+| Bad partition key | Negative | Hot shard — no amount of scaling helps |
+
 ---
 
 ## Questions Asked in This Study Session
@@ -1174,3 +2208,18 @@ Detection takes 10–30 seconds via the phi accrual failure detector (gossip-bas
 12. What is anti-entropy repair and when to use it?
 13. How to measure unreplicated data?
 14. What happens when a node dies?
+15. Does ScyllaDB automatically rebalance data?
+16. What are the production hardware requirements?
+17. What AWS instance types are recommended for ScyllaDB?
+18. Why is memory important even with NVMe?
+19. How to optimize write-heavy workloads (risk evaluation)?
+20. What ports need to be opened for ScyllaDB?
+21. Does ScyllaDB integrate with VictoriaMetrics?
+22. What collectors/exporters are available for ScyllaDB monitoring?
+23. How to enable automatic backups every 6 hours?
+24. How to restore from backups?
+25. How does backup work internally (snapshots, hard links, upload)?
+26. What is async I/O (io_uring/Linux AIO) and how does ScyllaDB use it?
+27. How does ScyllaDB's I/O scheduler prioritize reads over compaction?
+28. What is a shard in ScyllaDB?
+29. How do different tables with different partition keys end up on the same shard?
